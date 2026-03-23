@@ -1,6 +1,7 @@
 import streamlit as st
 import torch
 import librosa
+import numpy as np
 import io
 import pandas as pd
 import json
@@ -74,23 +75,38 @@ class ClinicalHistory(BaseModel):
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="Amharic Medical Scribe", layout="wide")
 
+# --- CUSTOM CSS ---
+st.markdown("""
+    <style>
+    /* Left-align buttons in the sidebar */
+    [data-testid="stSidebar"] button div {
+        justify-content: flex-start !important;
+    }
+    [data-testid="stSidebar"] button p {
+        text-align: left !important;
+        width: 100%;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.subheader("Patient Records")
-    # Mock list of patient records
+    # Mock list of patient records (now left-aligned via CSS)
     st.button("Abebe Kebede - 2026-03-24", use_container_width=True)
     st.button("Aster Mamo - 2026-03-23", use_container_width=True)
     st.button("Chala Demisse - 2026-03-20", use_container_width=True)
     st.button("Sara Tadesse - 2026-03-18", use_container_width=True)
     
     st.divider()
-    st.caption("Settings")
+    # Removed the "Settings" text caption
     api_key = st.text_input("Gemini API Key", type="password")
 
 # --- MODEL INITIALIZATION ---
 @st.cache_resource(show_spinner="Loading ASR Model...")
 def load_asr_model():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # Note: transformers pipeline also supports native chunking using chunk_length_s
     return pipeline(
         task="automatic-speech-recognition",
         model="agkphysics/wav2vec2-large-xlsr-53-amharic",
@@ -98,6 +114,46 @@ def load_asr_model():
     )
 
 asr_pipe = load_asr_model()
+
+# --- AUDIO CHUNKING LOGIC ---
+def transcribe_in_chunks(speech, sr, pipe, max_duration_sec=20):
+    """
+    Breaks audio at silences to avoid cutting words in half, groups them 
+    into ~20 second chunks, and transcribes sequentially to avoid truncation.
+    """
+    # Split audio based on silence (top_db threshold defines silence)
+    intervals = librosa.effects.split(speech, top_db=40)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for start, end in intervals:
+        # Add a tiny padding to the segment to ensure we don't clip tightly
+        pad = int(0.2 * sr)
+        s = max(0, start - pad)
+        e = min(len(speech), end + pad)
+        segment = speech[s:e]
+        
+        if current_length + len(segment) > max_duration_sec * sr and current_length > 0:
+            chunks.append(np.concatenate(current_chunk))
+            current_chunk = [segment]
+            current_length = len(segment)
+        else:
+            current_chunk.append(segment)
+            current_length += len(segment)
+            
+    if current_chunk:
+        chunks.append(np.concatenate(current_chunk))
+        
+    full_text = []
+    # Transcribe each silence-separated chunk
+    for chunk in chunks:
+        res = pipe(chunk)
+        if res and "text" in res:
+            full_text.append(res["text"])
+            
+    return " ".join(full_text)
 
 # --- GEMINI API CALL ---
 @retry(
@@ -135,7 +191,8 @@ def process_with_gemini(transcription: str, key: str):
     return json.loads(response.text)
 
 # --- MAIN UI WORKFLOW ---
-st.title("Clinical History Scribe")
+# Centered Header with padding
+# st.markdown("<h1 style='text-align: center; padding-bottom: 2rem;'>Clinical History Scribe</h1>", unsafe_allow_html=True)
 
 # Minimal Audio Input Section
 col_upload, col_record = st.columns(2)
@@ -152,10 +209,12 @@ if audio_value is not None:
         st.stop()
 
     with st.spinner("Transcribing and Structuring Note..."):
-        # Transcribe
+        # Load and Resample
         audio_bytes = audio_value.read()
         speech, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000)
-        transcription = asr_pipe(speech)["text"]
+        
+        # Transcribe with the new chunking logic
+        transcription = transcribe_in_chunks(speech, sr, asr_pipe)
         
         # Process with Gemini
         try:
